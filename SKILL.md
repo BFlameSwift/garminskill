@@ -3,7 +3,6 @@ name: garmin-pulse
 version: 1.3.1
 description: Syncs daily health and fitness data from Garmin Connect into markdown files. Provides sleep, activity, heart rate, stress, body battery, HRV, SpO2, and weight data.
 homepage: https://github.com/freakyflow/garminskill
-disable-model-invocation: true
 metadata: {"openclaw":{"emoji":"💪","requires":{"bins":["uv"]},"install":[{"id":"uv","kind":"brew","formula":"uv","bins":["uv"],"label":"Install uv via Homebrew"}]}}
 ---
 
