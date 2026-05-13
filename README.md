@@ -66,6 +66,20 @@ Authenticate and cache OAuth tokens. This only needs to happen once (~1 year tok
 uv run scripts/sync_garmin.py --setup --email you@example.com
 ```
 
+For Garmin China accounts, use the China endpoints:
+
+```bash
+uv run scripts/sync_garmin.py --setup --email you@example.com --cn
+```
+
+If Garmin China blocks the non-official API token flow, use the browser path
+instead. It reads the user's already logged-in Chrome Garmin Connect page via
+AppleScript and does not require saving a password or Chrome profile copy:
+
+```bash
+uv run scripts/sync_garmin.py --cn --browser
+```
+
 After setup succeeds, the password is no longer needed. All subsequent syncs use cached tokens only.
 
 ### Run it
@@ -73,6 +87,12 @@ After setup succeeds, the password is no longer needed. All subsequent syncs use
 ```bash
 # Sync today (no credentials needed — uses cached tokens)
 uv run scripts/sync_garmin.py
+
+# Sync today using Garmin China endpoints
+uv run scripts/sync_garmin.py --cn
+
+# Sync today from the logged-in Chrome Garmin Connect web UI
+uv run scripts/sync_garmin.py --cn --browser
 
 # Sync a specific date
 uv run scripts/sync_garmin.py --date 2025-01-26
@@ -121,11 +141,12 @@ If your Garmin account has 2FA enabled, authentication will fail. The `garmincon
 
 ### Cloudflare / random auth failures
 
-This skill uses [cloudscraper](https://github.com/VeNoMouS/cloudscraper) to bypass Cloudflare protection on Garmin's SSO. Garmin periodically updates their anti-bot measures, which can cause temporary breakdowns. If authentication suddenly stops working after a period of stability:
+Garmin periodically updates its anti-bot measures, which can cause temporary breakdowns. If authentication suddenly stops working after a period of stability:
 
 1. **Update dependencies:** `uv cache clean` then re-run the sync (uv will fetch the latest versions automatically)
 2. **Wait and retry.** Cloudflare blocks are often transient.
 3. **Check the [garminconnect issues page](https://github.com/cyberjunky/python-garminconnect/issues)** — others may be experiencing the same problem.
+4. For Garmin China, use `--cn --browser` if Chrome is already logged in and the API token flow fails.
 
 ### Tokens expired
 
@@ -133,7 +154,10 @@ Cached tokens last about a year. When they expire, the sync will tell you to re-
 
 ## Auth notes
 
-The script uses [garminconnect](https://github.com/cyberjunky/python-garminconnect) with [cloudscraper](https://github.com/VeNoMouS/cloudscraper) to bypass Cloudflare protection on Garmin's SSO. Authentication is split into two phases:
+The script uses [garminconnect](https://github.com/cyberjunky/python-garminconnect)
+for token-based sync, and can also use Chrome AppleScript for Garmin China
+browser-based sync. Authentication is split into two phases:
 
 1. **Setup** (`--setup`): Run once in a terminal to authenticate. `getpass` prompts for the password (never echoed to screen or stored in shell history). OAuth tokens are cached in `~/.garminconnect/` (~1 year validity). The password is used once and then discarded.
 2. **Sync** (default): Uses cached tokens only — no credentials needed. Token refresh is automatic (OAuth1 → OAuth2 exchange, no password required). If tokens expire or are revoked by Garmin, re-run setup.
+3. **Browser sync** (`--browser`): Reads the logged-in Garmin Connect web UI in Chrome and writes the same daily markdown file. This is useful for Garmin China accounts when the non-official API token exchange is blocked.

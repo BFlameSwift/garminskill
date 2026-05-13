@@ -1,43 +1,309 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["garminconnect>=0.2.38", "cloudscraper"]
+# dependencies = ["garminconnect>=0.3.2"]
 # ///
 """Sync daily health data from Garmin Connect into markdown files."""
 
 import argparse
+import json
+import os
+import re
+import subprocess
 import sys
 import time
-from datetime import date, timedelta
+from datetime import datetime, date, timedelta
 from getpass import getpass
 from pathlib import Path
 
-import cloudscraper
 from garminconnect import Garmin
+from garminconnect import client as garmin_client
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TOKEN_DIR = Path.home() / ".garminconnect"
 VERBOSE = False
 
+GARMIN_CN_APP = "https://connect.garmin.cn/app"
+GARMIN_GLOBAL_APP = "https://connect.garmin.com/app"
 
-def setup(email: str) -> None:
+NAV_LINES = {
+    "主页",
+    "挑战",
+    "日历",
+    "新消息",
+    "活动",
+    "健康统计",
+    "营养",
+    "表现统计",
+    "高尔夫",
+    "训练和计划",
+    "装备",
+    "Insights",
+    "报告",
+    "朋友",
+    "群组",
+    "徽章",
+    "个人纪录",
+    "目标",
+    "活动追踪准确性",
+    "如何同步",
+    "导入数据",
+}
+
+
+def env_flag(name: str) -> bool:
+    """Return true for common truthy environment variable values."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def configure_garmin_region(is_cn: bool) -> None:
+    """Patch garminconnect 0.3.2 globals that are not fully domain-aware."""
+    if not is_cn:
+        return
+
+    garmin_client.DI_TOKEN_URL = "https://diauth.garmin.cn/di-oauth2-service/oauth/token"
+    # Garmin China rejects a .cn grant_type with unsupported_grant_type; keep
+    # the library's .com grant_type while using China login/service endpoints.
+    garmin_client.IOS_SERVICE_URL = "https://connect.garmin.cn/app/"
+    garmin_client.MOBILE_SSO_SERVICE_URL = "https://connect.garmin.cn/app/"
+    garmin_client.PORTAL_SSO_SERVICE_URL = "https://connect.garmin.cn/app/"
+
+
+def applescript_quote(value: str) -> str:
+    """Quote a Python string as an AppleScript string literal."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def run_osascript(script: str, timeout: int = 60) -> str:
+    """Run AppleScript and return stdout."""
+    proc = subprocess.run(
+        ["/usr/bin/osascript"],
+        input=script,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(err or f"osascript exited with {proc.returncode}")
+    return proc.stdout.strip()
+
+
+def chrome_exec_js(js_code: str, timeout: int = 60) -> str:
+    """Execute JavaScript in Chrome's active tab via Apple Events."""
+    script = f"""
+tell application "Google Chrome"
+  if (count of windows) = 0 then error "Google Chrome is not running"
+  return execute active tab of front window javascript {applescript_quote(js_code)}
+end tell
+"""
+    return run_osascript(script, timeout=timeout)
+
+
+def chrome_open_work_tab(url: str) -> None:
+    """Open a temporary Chrome tab for browser-based Garmin sync."""
+    script = f"""
+tell application "Google Chrome"
+  activate
+  if (count of windows) = 0 then make new window
+  make new tab at end of tabs of front window with properties {{URL:{applescript_quote(url)}}}
+  set active tab index of front window to (count of tabs of front window)
+end tell
+"""
+    run_osascript(script)
+
+
+def chrome_set_url(url: str) -> None:
+    """Navigate the active Chrome tab."""
+    script = f"""
+tell application "Google Chrome"
+  if (count of windows) = 0 then error "Google Chrome is not running"
+  set URL of active tab of front window to {applescript_quote(url)}
+end tell
+"""
+    run_osascript(script)
+
+
+def chrome_close_active_tab() -> None:
+    """Close the active Chrome tab, ignoring failures."""
+    script = """
+tell application "Google Chrome"
+  if (count of windows) > 0 then close active tab of front window
+end tell
+"""
+    try:
+        run_osascript(script)
+    except Exception:
+        pass
+
+
+def collect_chrome_snapshot(url: str, label: str, wait_seconds: int = 8) -> dict:
+    """Navigate to a Garmin page and collect visible text from Chrome."""
+    chrome_set_url(url)
+    expected_prefix = url.rstrip("/")
+    time.sleep(2)
+    deadline = time.time() + max(wait_seconds, 3)
+    last: dict | None = None
+    js_code = """
+(() => {
+  const lines = document.body.innerText
+    .split(/\\n+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  return JSON.stringify({
+    href: location.href,
+    title: document.title,
+    ready: document.readyState,
+    lineCount: lines.length,
+    lines: lines.slice(0, 260)
+  });
+})()
+"""
+    while time.time() < deadline:
+        try:
+            raw = chrome_exec_js(js_code)
+            last = json.loads(raw)
+            text = "\n".join(last.get("lines") or [])
+            if (
+                str(last.get("href", "")).rstrip("/").startswith(expected_prefix)
+                and last.get("ready") == "complete"
+                and last.get("lineCount", 0) > 8
+                and "Garmin Connect" in last.get("title", "")
+                and not looks_like_login_page(text)
+            ):
+                break
+        except Exception as e:
+            last = {"label": label, "error": str(e)}
+        time.sleep(1)
+    if last is None:
+        last = {"label": label, "error": "No snapshot returned"}
+    last["label"] = label
+    return last
+
+
+def looks_like_login_page(text: str) -> bool:
+    """Detect Garmin login/error pages instead of authenticated app pages."""
+    lowered = text.lower()
+    return (
+        ("password" in lowered or "密码" in text)
+        and ("sign in" in lowered or "登录" in text)
+        and "主页" not in text
+    )
+
+
+def clean_browser_lines(lines: list[str], limit: int = 120) -> list[str]:
+    """Remove repeated chrome/navigation noise while preserving data lines."""
+    cleaned: list[str] = []
+    previous = None
+    for line in lines:
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or line == previous:
+            continue
+        previous = line
+        if line in NAV_LINES:
+            continue
+        if line in {"查看全部", "隐藏", "编辑主页", "预览"}:
+            continue
+        cleaned.append(line)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def browser_routes_for_day(day: date, is_cn: bool) -> list[tuple[str, str]]:
+    """Return Garmin web routes worth scraping for one day."""
+    base = GARMIN_CN_APP if is_cn else GARMIN_GLOBAL_APP
+    day_str = day.isoformat()
+    return [
+        ("Home", f"{base}/home"),
+        ("Sleep", f"{base}/sleep/{day_str}"),
+        ("Heart Rate", f"{base}/heart-rate/{day_str}"),
+        ("Stress", f"{base}/stress/{day_str}/0"),
+        ("Training Readiness", f"{base}/training-readiness/{day_str}"),
+        ("Activities", f"{base}/activities"),
+    ]
+
+
+def sync_days_from_browser(days: list[date], output_dir: Path, is_cn: bool) -> None:
+    """Sync Garmin data by reading the user's logged-in Chrome session."""
+    base = GARMIN_CN_APP if is_cn else GARMIN_GLOBAL_APP
+    chrome_open_work_tab(f"{base}/home")
+    try:
+        for day in sorted(days):
+            sync_day_from_browser(day, output_dir, is_cn)
+    finally:
+        chrome_close_active_tab()
+
+
+def sync_day_from_browser(day: date, output_dir: Path, is_cn: bool) -> None:
+    """Write a health markdown file from Garmin Connect web UI snapshots."""
+    day_str = day.isoformat()
+    display_date = day.strftime("%B %-d, %Y")
+    sections = [
+        f"# Health — {display_date}",
+        (
+            "_Source: Garmin Connect web UI via the user's logged-in Chrome "
+            f"session. Synced at {datetime.now().isoformat(timespec='seconds')}._"
+        ),
+    ]
+
+    snapshots: list[dict] = []
+    for label, url in browser_routes_for_day(day, is_cn):
+        if VERBOSE:
+            print(f"  [browser] Reading {label}: {url}", file=sys.stderr)
+        snapshots.append(collect_chrome_snapshot(url, label))
+
+    login_errors = []
+    for snap in snapshots:
+        lines = snap.get("lines") or []
+        text = "\n".join(lines)
+        if looks_like_login_page(text):
+            login_errors.append(snap.get("href", snap.get("label", "unknown")))
+
+    if login_errors:
+        raise RuntimeError(
+            "Garmin Connect is not logged in in Chrome. Open "
+            f"{GARMIN_CN_APP if is_cn else GARMIN_GLOBAL_APP}/home, log in, "
+            "then rerun with --browser."
+        )
+
+    for snap in snapshots:
+        label = snap.get("label", "Snapshot")
+        if snap.get("error"):
+            sections.append(f"## {label}\nUnable to read page: {snap['error']}")
+            continue
+        lines = clean_browser_lines(snap.get("lines") or [])
+        if not lines:
+            continue
+        sections.append(f"## {label}\n" + "\n".join(f"- {line}" for line in lines))
+
+    if len(sections) <= 2:
+        print(f"  {day_str}: No browser-visible Garmin data available, skipping.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"{day_str}.md"
+    output_file.write_text("\n\n".join(sections) + "\n")
+    print(f"  {day_str}: Written to {output_file}")
+
+
+def setup(email: str, is_cn: bool = False) -> None:
     """One-time interactive setup: authenticate with email/password and cache tokens."""
+    configure_garmin_region(is_cn)
     password = getpass("Garmin Connect password: ")
     if not password:
         print("Error: Password cannot be empty.", file=sys.stderr)
         sys.exit(1)
 
-    client = Garmin(email, password)
-    client.garth.sess = cloudscraper.create_scraper()
-
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     tokenstore = str(TOKEN_DIR)
+    client = Garmin(email, password, is_cn=is_cn)
 
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            client.login()
-            client.garth.dump(tokenstore)
+            client.login(tokenstore)
             last_exc = None
             break
         except Exception as e:
@@ -50,7 +316,14 @@ def setup(email: str) -> None:
     if last_exc is not None:
         msg = str(last_exc).lower()
         print(f"Error: Authentication failed — {last_exc}", file=sys.stderr)
-        if "no profile" in msg or "connectapi" in msg:
+        if "account_locked" in msg or "generalLoginAccountLocked" in str(last_exc):
+            print(
+                "\nGarmin reports this account is temporarily locked. Stop retrying\n"
+                "from the script, sign in once in a browser to unlock/check the\n"
+                "account, then rerun setup.",
+                file=sys.stderr,
+            )
+        elif "no profile" in msg or "connectapi" in msg:
             print(
                 "\nThis usually means Garmin's servers are temporarily blocking requests.\n"
                 "Try again in a few minutes. If it persists, double-check your password.",
@@ -75,13 +348,21 @@ def setup(email: str) -> None:
     print("You can now run the sync command without credentials.")
 
 
-def authenticate() -> Garmin:
+def authenticate(is_cn: bool = False) -> Garmin:
     """Authenticate with Garmin Connect using cached tokens only."""
-    client = Garmin()
-    client.garth.sess = cloudscraper.create_scraper()
-
+    configure_garmin_region(is_cn)
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     tokenstore = str(TOKEN_DIR)
+    if not any(TOKEN_DIR.iterdir()):
+        cn_suffix = " --cn" if is_cn else ""
+        print(
+            "Error: No cached tokens found.\n"
+            "Run setup first:\n\n"
+            f"  uv run scripts/sync_garmin.py --setup --email you@example.com{cn_suffix}\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    client = Garmin(is_cn=is_cn)
 
     last_exc: Exception | None = None
     for attempt in range(3):
@@ -89,10 +370,11 @@ def authenticate() -> Garmin:
             client.login(tokenstore)
             return client
         except FileNotFoundError:
+            cn_suffix = " --cn" if is_cn else ""
             print(
                 "Error: No cached tokens found.\n"
                 "Run setup first:\n\n"
-                "  uv run scripts/sync_garmin.py --setup --email you@example.com\n",
+                f"  uv run scripts/sync_garmin.py --setup --email you@example.com{cn_suffix}\n",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -596,6 +878,19 @@ def main() -> None:
     parser.add_argument("--days", type=int, help="Sync the last N days.")
     parser.add_argument("--verbose", action="store_true", help="Show detailed error info for failed data fetches.")
     parser.add_argument(
+        "--cn",
+        action="store_true",
+        help="Use Garmin China endpoints (garmin.cn). Can also be enabled with GARMIN_CONNECT_CN=1.",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help=(
+            "Sync from the user's currently logged-in Chrome Garmin Connect web UI "
+            "using AppleScript instead of cached API tokens."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="health",
@@ -605,12 +900,14 @@ def main() -> None:
 
     global VERBOSE
     VERBOSE = args.verbose
+    is_cn = args.cn or env_flag("GARMIN_CONNECT_CN")
+    use_browser = args.browser or env_flag("GARMIN_CONNECT_BROWSER")
 
     if args.setup:
         if not args.email:
             print("Error: --email is required with --setup.", file=sys.stderr)
             sys.exit(1)
-        setup(args.email)
+        setup(args.email, is_cn=is_cn)
         return
 
     # Always resolve output-dir relative to the skill's base directory, not CWD
@@ -631,8 +928,14 @@ def main() -> None:
     else:
         days = [date.today()]
 
-    print("Authenticating with Garmin Connect...")
-    client = authenticate()
+    if use_browser:
+        print("Syncing Garmin Connect from Chrome browser session...")
+        sync_days_from_browser(days, output_dir, is_cn=is_cn)
+        print("Done.")
+        return
+
+    client = authenticate(is_cn=is_cn)
+    print("Authenticated with Garmin Connect.")
     print(f"Syncing {len(days)} day(s)...")
 
     for day in sorted(days):
