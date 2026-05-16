@@ -118,6 +118,9 @@ uv run scripts/sync_garmin.py
 # Sync today using Garmin China endpoints
 uv run scripts/sync_garmin.py --cn
 
+# Sync richer local data and rebuild the long-term profile
+uv run scripts/sync_garmin.py --cn --days 30 --raw-json
+
 # Manual fallback: sync today from the logged-in Chrome Garmin Connect web UI
 uv run scripts/sync_garmin.py --cn --browser
 
@@ -133,6 +136,14 @@ uv run scripts/sync_garmin.py --output-dir my-data
 
 Markdown files are written to `health/YYYY-MM-DD.md` by default (relative to the skill's base directory).
 
+Long-term profile files are rebuilt after sync:
+
+- `health/profile.md` — compact longitudinal health profile, rolling-window table, trend deltas, and watchlist.
+- `health/metrics.json` — machine-readable daily metrics and rolling-window summaries.
+- `health/raw/YYYY-MM-DD.json` — optional private raw API snapshots when `--raw-json` is used.
+
+Use `--no-profile` only when you intentionally want to skip profile rebuilds.
+
 ### Install as an OpenClaw skill
 
 ```bash
@@ -141,10 +152,10 @@ ln -s /path/to/garminskill ~/.openclaw/skills/garmin-connect
 
 ### Cron
 
-Schedule the API sync to run every morning so your data stays up to date automatically. No credentials needed — the sync uses cached auth material from the one-time setup. For Garmin China, include `--cn`; do not include `--browser` in the scheduled command unless you intentionally want the browser fallback. OpenClaw's `cron` tool can handle this, or use a system crontab:
+Schedule the API sync to run every morning so your data stays up to date automatically. No credentials needed — the sync uses cached auth material from the one-time setup. For Garmin China, include `--cn --raw-json`; do not include `--browser` in the scheduled command unless you intentionally want the browser fallback. OpenClaw's `cron` tool can handle this, or use a system crontab:
 
 ```bash
-0 7 * * * uv run /path/to/garminskill/scripts/sync_garmin.py --cn
+0 7 * * * uv run /path/to/garminskill/scripts/sync_garmin.py --cn --raw-json
 ```
 
 ## Troubleshooting

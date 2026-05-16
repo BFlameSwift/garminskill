@@ -1,2 +1,5 @@
 health/*.md
+health/*.json
+health/raw/
+health/backfill*.log
 .claude/

@@ -7,6 +7,9 @@ Use this runbook when maintaining the local Garmin Health OpenClaw agent, repair
 - Skill directory: `/Users/liyu/.openclaw/skills/garmin-connect`
 - Sync script: `/Users/liyu/.openclaw/skills/garmin-connect/scripts/sync_garmin.py`
 - Health markdown output: `/Users/liyu/.openclaw/skills/garmin-connect/health/YYYY-MM-DD.md`
+- Long-term profile: `/Users/liyu/.openclaw/skills/garmin-connect/health/profile.md`
+- Machine metrics: `/Users/liyu/.openclaw/skills/garmin-connect/health/metrics.json`
+- Optional raw API snapshots: `/Users/liyu/.openclaw/skills/garmin-connect/health/raw/YYYY-MM-DD.json`
 - Garmin CN web-session cache: `/Users/liyu/.garminconnect/garmin_cn_web_session.json`
 - macOS Keychain service: `openclaw.garmin-connect.cn`
 - macOS Keychain account: the Garmin account email
@@ -104,14 +107,41 @@ cd /Users/liyu/.openclaw/skills/garmin-connect
 uv run scripts/sync_garmin.py --cn --days 3 --verbose
 ```
 
+Sync a richer recent history and refresh long-term profile files:
+
+```bash
+cd /Users/liyu/.openclaw/skills/garmin-connect
+uv run scripts/sync_garmin.py --cn --days 30 --verbose --raw-json
+```
+
+Backfill longer history for trend management:
+
+```bash
+cd /Users/liyu/.openclaw/skills/garmin-connect
+uv run scripts/sync_garmin.py --cn --days 180 --verbose --raw-json
+```
+
+For a full-year baseline, use `--days 365` if Garmin rate limits are not
+triggered. If the backfill is interrupted, rerun the same command; existing
+daily files are overwritten with fresh API data.
+
 Expected success contains:
 
 ```text
 Authenticated with Garmin Connect.
 Syncing N day(s)...
 YYYY-MM-DD: Written to /Users/liyu/.openclaw/skills/garmin-connect/health/YYYY-MM-DD.md
+Wrote /Users/liyu/.openclaw/skills/garmin-connect/health/profile.md
+Wrote /Users/liyu/.openclaw/skills/garmin-connect/health/metrics.json
 Done.
 ```
+
+Health management reading order for the Garmin agent:
+
+1. Read `health/profile.md` for coverage, rolling windows, trend deltas, and watchlist.
+2. Read `health/metrics.json` for exact time-series metrics when comparing windows.
+3. Read specific `health/YYYY-MM-DD.md` files for daily summaries.
+4. Inspect `health/raw/YYYY-MM-DD.json` only when the markdown omits a needed Garmin field.
 
 ## OpenClaw Cron Integration
 
@@ -119,8 +149,8 @@ The Garmin cron jobs should run as `agentId=garmin` with `toolsAllow=["exec"]`. 
 
 Current local jobs:
 
-- `61db6bed-f7ed-464a-bc58-0bc6330e97cb` — `Garmin daily health sync`, 07:00 Asia/Shanghai, sync only, no Feishu delivery.
-- `f35c6610-f44e-4d28-aeab-2f9216671a09` — `Garmin nightly analysis`, 22:00 Asia/Shanghai, syncs last three days and sends the report to Feishu using the `garmin` account.
+- `61db6bed-f7ed-464a-bc58-0bc6330e97cb` — `Garmin daily health sync`, 07:00 Asia/Shanghai, syncs recent data with `--raw-json`, refreshes long-term profile, no Feishu delivery.
+- `f35c6610-f44e-4d28-aeab-2f9216671a09` — `Garmin nightly analysis`, 22:00 Asia/Shanghai, syncs a recent window, reads `health/profile.md`, and sends the report to Feishu using the `garmin` account.
 
 Verify latest runs:
 

@@ -1,7 +1,7 @@
 ---
 name: garmin-pulse
-version: 1.4.0
-description: Use when the user asks about Garmin Connect, Garmin health data, sleep, activities, running, heart rate, stress, body battery, HRV, SpO2, weight, or whether Garmin data is connected. Syncs daily health and fitness data into markdown files.
+version: 1.5.0
+description: Use when the user asks about Garmin Connect, Garmin health data, sleep, activities, running, heart rate, stress, body battery, HRV, SpO2, weight, long-term health trends, or whether Garmin data is connected. Syncs daily health and fitness data into markdown files and maintains a long-term local health profile.
 homepage: https://github.com/freakyflow/garminskill
 metadata: {"openclaw":{"emoji":"💪","requires":{"bins":["uv"]},"install":[{"id":"uv","kind":"brew","formula":"uv","bins":["uv"],"label":"Install uv via Homebrew"}]}}
 ---
@@ -102,11 +102,31 @@ Sync the last N days:
 uv run {baseDir}/scripts/sync_garmin.py --days 7
 ```
 
+Sync richer local data for deeper health management:
+
+```bash
+uv run {baseDir}/scripts/sync_garmin.py --cn --days 30 --raw-json
+```
+
+`--raw-json` writes private daily API snapshots under
+`{baseDir}/health/raw/YYYY-MM-DD.json`; use it for recent days or backfills
+where detailed review may matter. Normal syncs also refresh the long-term
+profile files unless `--no-profile` is passed.
+
 ## Reading Health Data
 
 Health files are stored at `{baseDir}/health/YYYY-MM-DD.md` — one file per day.
 
-To answer health or fitness questions, read the relevant date's file from the `{baseDir}/health/` directory. If the file doesn't exist for the requested date, run the sync command for that date first.
+For long-term health management, read in this order:
+
+1. `{baseDir}/health/profile.md` — compact longitudinal profile and watchlist.
+2. `{baseDir}/health/metrics.json` — machine-readable daily metrics and rolling windows.
+3. `{baseDir}/health/YYYY-MM-DD.md` — readable daily summary for specific dates.
+4. `{baseDir}/health/raw/YYYY-MM-DD.json` — raw Garmin API payloads when deeper inspection is needed.
+
+If a requested date is missing, run the sync command for that date first. If the
+question is about baseline, trend, recovery, or health management over time,
+refresh a larger window first, such as `--days 30`, `--days 90`, or `--days 365`.
 
 ## Dependencies
 
@@ -125,8 +145,8 @@ password on the command line.
 **Paths written by this skill:**
 
 - `~/.garminconnect/` — cached OAuth tokens or Garmin China web-session cookies (sensitive; grants access to the user's Garmin account)
-- `{baseDir}/health/` — daily health markdown files (contains personal health data)
+- `{baseDir}/health/` — daily health markdown files, long-term profile, metrics JSON, and optional raw API snapshots (contains personal health data)
 
 ## Cron Setup
 
-Schedule the sync script to run every morning using OpenClaw's `cron` tool so your health data stays up to date automatically. No environment variables or credentials are needed — the sync uses cached tokens from the one-time setup. For Garmin China, the cron command should normally use `--cn` only; keep `--browser` as a manual fallback, not the default scheduled path.
+Schedule the sync script to run every morning using OpenClaw's `cron` tool so your health data stays up to date automatically. No environment variables or credentials are needed — the sync uses cached tokens from the one-time setup. For Garmin China, the cron command should normally use `--cn --raw-json` for richer daily records; keep `--browser` as a manual fallback, not the default scheduled path. The nightly analysis job should read `health/profile.md` before daily files so feedback stays longitudinal rather than single-day only.

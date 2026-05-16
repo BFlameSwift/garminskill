@@ -26,6 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 TOKEN_DIR = Path.home() / ".garminconnect"
 CN_WEB_SESSION_FILE = TOKEN_DIR / "garmin_cn_web_session.json"
 VERBOSE = False
+API_TIMEOUT = 30
 KEYCHAIN_SERVICE_GLOBAL = "openclaw.garmin-connect"
 KEYCHAIN_SERVICE_CN = "openclaw.garmin-connect.cn"
 
@@ -133,6 +134,34 @@ def write_secret_json(path: Path, payload: dict[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    except Exception:
+        with contextlib.suppress(Exception):
+            os.close(fd)
+        raise
+    os.replace(tmp, path)
+    with contextlib.suppress(Exception):
+        path.chmod(0o600)
+
+
+def json_default(value: Any) -> str:
+    """Serialize non-standard values from Garmin responses conservatively."""
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return str(value)
+
+
+def write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write personal health JSON with user-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        path.parent.chmod(0o700)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, default=json_default)
             handle.write("\n")
     except Exception:
         with contextlib.suppress(Exception):
@@ -255,7 +284,7 @@ class GarminCnWebClient:
         response = self.session.get(
             "https://connect.garmin.cn/modern/",
             headers={"Accept": "text/html,application/xhtml+xml"},
-            timeout=30,
+            timeout=API_TIMEOUT,
         )
         response.raise_for_status()
         state = parse_cn_modern_state(response.text)
@@ -274,7 +303,7 @@ class GarminCnWebClient:
             url,
             headers=headers,
             params=kwargs.get("params"),
-            timeout=kwargs.get("timeout", 30),
+            timeout=kwargs.get("timeout", API_TIMEOUT),
         )
         if response.status_code in {401, 403}:
             self.refresh_session()
@@ -283,7 +312,7 @@ class GarminCnWebClient:
                 url,
                 headers=headers,
                 params=kwargs.get("params"),
-                timeout=kwargs.get("timeout", 30),
+                timeout=kwargs.get("timeout", API_TIMEOUT),
             )
         if response.status_code == 204:
             return {}
@@ -1164,52 +1193,469 @@ def fetch_activities(client: Garmin, day: str) -> str | None:
     return "\n".join(lines)
 
 
-def sync_day(client: Garmin, day: date, output_dir: Path) -> None:
+def fetch_metric(label: str, call: Any) -> tuple[Any | None, str | None]:
+    """Fetch one Garmin metric while preserving partial daily syncs."""
+    try:
+        return call(), None
+    except Exception as e:
+        if VERBOSE:
+            print(f"    [verbose] {label} fetch failed: {e}", file=sys.stderr)
+        return None, str(e)
+
+
+def collect_daily_data(client: Garmin, day: str) -> tuple[dict[str, Any], dict[str, str]]:
+    """Collect the daily Garmin API payloads used for markdown and raw JSON."""
+    data: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+
+    specs = [
+        ("sleep", "Sleep", lambda: client.get_sleep_data(day)),
+        ("userSummary", "User summary", lambda: client.get_user_summary(day)),
+        ("heartRates", "Heart rate", lambda: client.get_heart_rates(day)),
+        ("bodyBattery", "Body battery", lambda: client.get_body_battery(day, day)),
+        ("hrv", "HRV", lambda: client.get_hrv_data(day)),
+        ("spo2", "SpO2", lambda: client.get_spo2_data(day)),
+        ("weight", "Weight", lambda: client.get_daily_weigh_ins(day)),
+        ("stress", "Stress", lambda: client.get_all_day_stress(day)),
+        ("trainingReadiness", "Training readiness", lambda: client.get_training_readiness(day)),
+        ("respiration", "Respiration", lambda: client.get_respiration_data(day)),
+        ("fitnessAge", "Fitness age", lambda: client.get_fitnessage_data(day)),
+        ("intensityMinutes", "Intensity minutes", lambda: client.get_intensity_minutes_data(day)),
+        ("activities", "Activities", lambda: client.get_activities_by_date(day, day)),
+    ]
+
+    for key, label, call in specs:
+        value, error = fetch_metric(label, call)
+        if error:
+            errors[key] = error
+        else:
+            data[key] = value
+    return data, errors
+
+
+def values_from_pairs(items: Any) -> list[float]:
+    """Extract numeric values from Garmin time-series pair arrays."""
+    values: list[float] = []
+    if not isinstance(items, list):
+        return values
+    for item in items:
+        value = None
+        if isinstance(item, list) and len(item) >= 2:
+            value = item[1]
+        elif isinstance(item, dict):
+            value = item.get("value") or item.get("heartRate") or item.get("stressLevel")
+        if isinstance(value, (int, float)) and value > 0:
+            values.append(float(value))
+    return values
+
+
+def fmt_avg(values: list[float]) -> str | None:
+    """Format average/min/max for a numeric series."""
+    if not values:
+        return None
+    avg = round(sum(values) / len(values))
+    return f"Avg {avg} | Low {round(min(values))} | High {round(max(values))}"
+
+
+def format_sleep_data(data: dict[str, Any]) -> str | None:
+    """Format sleep data from a collected Garmin payload."""
+    payload = data.get("sleep")
+    if not isinstance(payload, dict):
+        return None
+    daily = payload.get("dailySleepDTO", {})
+    if not daily or not daily.get("sleepTimeSeconds"):
+        return None
+
+    total = fmt_duration(daily.get("sleepTimeSeconds"))
+    deep = fmt_duration(daily.get("deepSleepSeconds"))
+    light = fmt_duration(daily.get("lightSleepSeconds"))
+    rem = fmt_duration(daily.get("remSleepSeconds"))
+    awake = fmt_duration(daily.get("awakeSleepSeconds"))
+    scores = daily.get("sleepScores", {}) or {}
+    overall = scores.get("overall", {}) if isinstance(scores, dict) else {}
+    score = overall.get("value")
+    qualifier = overall.get("qualifierKey", "")
+    qualifier_str = qualifier.replace("_", " ").title() if qualifier else ""
+
+    header = f"## Sleep: {total}"
+    if qualifier_str:
+        header += f" ({qualifier_str})"
+    lines = [header, f"Deep: {deep} | Light: {light} | REM: {rem} | Awake: {awake}"]
+    if score is not None:
+        lines.append(f"Sleep Score: {score}")
+
+    score_parts = []
+    if isinstance(scores, dict):
+        for key, item in scores.items():
+            if key == "overall" or not isinstance(item, dict):
+                continue
+            value = item.get("value")
+            qualifier_key = item.get("qualifierKey")
+            if value is None:
+                continue
+            label = key.replace("Percentage", "").replace("Seconds", "").replace("_", " ").title()
+            part = f"{label}: {value}"
+            if qualifier_key:
+                part += f" ({str(qualifier_key).replace('_', ' ').title()})"
+            score_parts.append(part)
+    if score_parts:
+        lines.append("Sleep Score Details: " + " | ".join(score_parts[:8]))
+
+    return "\n".join(lines)
+
+
+def format_body_data(data: dict[str, Any]) -> str | None:
+    """Format body, heart, battery, HRV, SpO2, and weight payloads."""
+    summary = data.get("userSummary") if isinstance(data.get("userSummary"), dict) else None
+    hr_data = data.get("heartRates") if isinstance(data.get("heartRates"), dict) else None
+    body_battery = data.get("bodyBattery")
+    hrv_data = data.get("hrv") if isinstance(data.get("hrv"), dict) else None
+    spo2_data = data.get("spo2") if isinstance(data.get("spo2"), dict) else None
+    weight_data = data.get("weight") if isinstance(data.get("weight"), dict) else None
+
+    if not any([summary, hr_data, body_battery, hrv_data, spo2_data, weight_data]):
+        return None
+
+    steps = summary.get("totalSteps") if summary else None
+    calories = summary.get("totalKilocalories") if summary else None
+    header_parts = []
+    if steps is not None:
+        header_parts.append(f"{steps:,} steps")
+    if calories is not None:
+        header_parts.append(f"{int(calories):,} cal")
+
+    header = "## Body"
+    if header_parts:
+        header += ": " + " | ".join(header_parts)
+    lines = [header]
+
+    if summary:
+        detail_parts = []
+        distance_m = summary.get("totalDistanceMeters")
+        if distance_m is not None:
+            detail_parts.append(f"Distance: {distance_m / 1000:.1f} km")
+        floors = summary.get("floorsAscended")
+        if floors is not None:
+            detail_parts.append(f"Floors: {int(floors)}")
+        active_cal = summary.get("activeKilocalories")
+        if active_cal is not None:
+            detail_parts.append(f"Active Calories: {int(active_cal)}")
+        active_seconds = summary.get("activeSeconds")
+        if active_seconds is not None:
+            detail_parts.append(f"Active Time: {fmt_duration(active_seconds)}")
+        if detail_parts:
+            lines.append(" | ".join(detail_parts))
+
+    if hr_data:
+        hr_parts = []
+        resting = hr_data.get("restingHeartRate")
+        if resting:
+            hr_parts.append(f"Resting HR: {resting} bpm")
+        max_hr = hr_data.get("maxHeartRate")
+        if max_hr:
+            hr_parts.append(f"Max HR: {max_hr} bpm")
+        series_summary = fmt_avg(values_from_pairs(hr_data.get("heartRateValues")))
+        if series_summary:
+            hr_parts.append(f"Daily HR: {series_summary}")
+        if hr_parts:
+            lines.append(" | ".join(hr_parts))
+
+    battery_values = []
+    if isinstance(body_battery, list):
+        for item in body_battery:
+            if isinstance(item, dict):
+                for key in ("chargedValue", "drainedValue", "maxBodyBattery", "minBodyBattery"):
+                    value = item.get(key)
+                    if isinstance(value, (int, float)) and value > 0:
+                        battery_values.append(float(value))
+                battery_values.extend(values_from_pairs(item.get("bodyBatteryValuesArray")))
+    extra_parts = []
+    if battery_values:
+        extra_parts.append(
+            f"Body Battery: latest {round(battery_values[-1])} | low {round(min(battery_values))} | high {round(max(battery_values))}"
+        )
+    if hrv_data:
+        hrv_summary = hrv_data.get("hrvSummary", {})
+        if isinstance(hrv_summary, dict):
+            hrv = hrv_summary.get("weeklyAvg") or hrv_summary.get("lastNightAvg")
+            if hrv is not None:
+                extra_parts.append(f"HRV: {hrv} ms")
+    if extra_parts:
+        lines.append(" | ".join(extra_parts))
+
+    if spo2_data:
+        spo2 = spo2_data.get("averageSpO2")
+        lowest = spo2_data.get("lowestSpO2")
+        if spo2 is not None:
+            line = f"SpO2: {spo2}%"
+            if lowest is not None:
+                line += f" | Lowest: {lowest}%"
+            lines.append(line)
+
+    if weight_data:
+        entries = weight_data.get("dateWeightList", [])
+        if entries:
+            grams = entries[0].get("weight")
+            if grams:
+                lines.append(f"Weight: {grams / 1000:.1f} kg")
+
+    return "\n".join(lines)
+
+
+def format_stress_data(data: dict[str, Any]) -> str | None:
+    """Format stress data from a collected Garmin payload."""
+    payload = data.get("stress")
+    if not isinstance(payload, dict):
+        return None
+    avg = payload.get("overallStressLevel")
+    if avg is None:
+        return None
+    if avg < 26:
+        level = "Rest"
+    elif avg < 51:
+        level = "Low"
+    elif avg < 76:
+        level = "Medium"
+    else:
+        level = "High"
+    details = []
+    for key, label in [
+        ("restStressDuration", "Rest"),
+        ("lowStressDuration", "Low"),
+        ("mediumStressDuration", "Medium"),
+        ("highStressDuration", "High"),
+    ]:
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            details.append(f"{label}: {fmt_duration(value)}")
+    line = f"## Stress: Avg {avg} ({level})"
+    if details:
+        line += "\n" + " | ".join(details)
+    return line
+
+
+def format_training_readiness_data(data: dict[str, Any]) -> str | None:
+    """Format training readiness from a collected Garmin payload."""
+    payload = data.get("trainingReadiness")
+    if not isinstance(payload, list) or not payload:
+        return None
+    entry = payload[0]
+    score = entry.get("score") if isinstance(entry, dict) else None
+    if score is None:
+        return None
+    level = entry.get("level", "").replace("_", " ").title()
+    feedback = entry.get("feedbackShort", "").replace("_", " ").title()
+    line = f"## Training Readiness: {score}"
+    if level:
+        line += f" ({level})"
+    if feedback:
+        line += f" — {feedback}"
+    contributors = []
+    for key, label in [
+        ("sleepScore", "Sleep"),
+        ("recoveryTime", "Recovery Time"),
+        ("hrvStatus", "HRV Status"),
+        ("acuteLoad", "Acute Load"),
+        ("sleepHistory", "Sleep History"),
+        ("stressHistory", "Stress History"),
+    ]:
+        value = entry.get(key)
+        if value is not None:
+            contributors.append(f"{label}: {value}")
+    if contributors:
+        line += "\nReadiness Factors: " + " | ".join(contributors[:8])
+    return line
+
+
+def format_respiration_data(data: dict[str, Any]) -> str | None:
+    """Format respiration from a collected Garmin payload."""
+    payload = data.get("respiration")
+    if not isinstance(payload, dict):
+        return None
+    parts = []
+    avg_waking = payload.get("avgWakingRespirationValue")
+    if avg_waking:
+        parts.append(f"Waking: {avg_waking:.0f} brpm")
+    avg_sleeping = payload.get("avgSleepRespirationValue")
+    if avg_sleeping:
+        parts.append(f"Sleeping: {avg_sleeping:.0f} brpm")
+    lowest = payload.get("lowestRespirationValue")
+    highest = payload.get("highestRespirationValue")
+    if lowest and highest:
+        parts.append(f"Range: {lowest:.0f}–{highest:.0f}")
+    if not parts:
+        return None
+    return "## Respiration: " + " | ".join(parts)
+
+
+def format_fitness_age_data(data: dict[str, Any]) -> str | None:
+    """Format fitness age from a collected Garmin payload."""
+    payload = data.get("fitnessAge")
+    if not isinstance(payload, dict):
+        return None
+    fitness_age = payload.get("fitnessAge")
+    chrono_age = payload.get("chronologicalAge")
+    if fitness_age is None:
+        return None
+    line = f"## Fitness Age: {int(fitness_age)}"
+    if chrono_age is not None:
+        diff = int(fitness_age) - chrono_age
+        if diff < 0:
+            line += f" ({abs(diff)} years younger)"
+        elif diff > 0:
+            line += f" ({diff} years older)"
+    return line
+
+
+def format_intensity_minutes_data(data: dict[str, Any]) -> str | None:
+    """Format weekly intensity minutes from a collected Garmin payload."""
+    payload = data.get("intensityMinutes")
+    if not isinstance(payload, dict):
+        return None
+    moderate = payload.get("weeklyModerate")
+    vigorous = payload.get("weeklyVigorous")
+    total = payload.get("weeklyTotal")
+    goal = payload.get("weekGoal")
+    if total is None:
+        return None
+    parts = [f"## Intensity Minutes: {total} weekly"]
+    detail = []
+    if moderate is not None:
+        detail.append(f"Moderate: {moderate}")
+    if vigorous is not None:
+        detail.append(f"Vigorous: {vigorous}")
+    if goal is not None:
+        detail.append(f"Goal: {goal}")
+    if detail:
+        parts.append(" | ".join(detail))
+    return "\n".join(parts)
+
+
+def format_activities_data(data: dict[str, Any]) -> str | None:
+    """Format activities from a collected Garmin payload."""
+    activities = data.get("activities")
+    if not isinstance(activities, list) or not activities:
+        return None
+    lines = ["## Activities"]
+    for act in activities:
+        if not isinstance(act, dict):
+            continue
+        name = act.get("activityName", "Activity")
+        duration = fmt_duration_mmss(act.get("duration"))
+        header_parts = [f"**{name}** — {duration}"]
+        distance = act.get("distance")
+        if distance and distance > 0:
+            header_parts.append(f"{distance / 1000:.1f} km")
+        calories = act.get("calories")
+        if calories and calories > 0:
+            header_parts.append(f"{int(calories)} cal")
+        lines.append("- " + ", ".join(header_parts))
+
+        details = []
+        avg_hr = act.get("averageHR")
+        max_hr = act.get("maxHR")
+        if avg_hr and avg_hr > 0:
+            hr_str = f"Avg HR {int(avg_hr)}"
+            if max_hr and max_hr > 0:
+                hr_str += f" / Max {int(max_hr)}"
+            details.append(hr_str)
+        elev = act.get("elevationGain")
+        if elev and elev > 0:
+            details.append(f"Elevation: +{int(elev)}m")
+        avg_speed = act.get("averageSpeed")
+        if avg_speed and avg_speed > 0 and distance and distance > 0:
+            pace_sec = 1000 / avg_speed
+            details.append(f"Pace: {int(pace_sec) // 60}:{int(pace_sec) % 60:02d}/km")
+        cadence = act.get("averageRunningCadenceInStepsPerMinute")
+        if cadence and cadence > 0:
+            details.append(f"Cadence: {int(cadence)} spm")
+        avg_power = act.get("avgPower")
+        if avg_power and avg_power > 0:
+            power_str = f"Power: {int(avg_power)}W"
+            max_power = act.get("maxPower")
+            if max_power and max_power > 0:
+                power_str += f" / Max {int(max_power)}W"
+            details.append(power_str)
+        aero_te = act.get("aerobicTrainingEffect")
+        anaero_te = act.get("anaerobicTrainingEffect")
+        if aero_te and aero_te > 0:
+            te_str = f"Training Effect: {aero_te:.1f} aerobic"
+            if anaero_te and anaero_te > 0:
+                te_str += f" / {anaero_te:.1f} anaerobic"
+            details.append(te_str)
+        vo2 = act.get("vO2MaxValue")
+        if vo2 and vo2 > 0:
+            details.append(f"VO2 Max: {int(vo2)}")
+        if details:
+            lines.append("  " + " | ".join(details))
+    return "\n".join(lines)
+
+
+def format_collected_day(data: dict[str, Any]) -> list[str]:
+    """Format all collected Garmin payloads into markdown sections."""
+    sections = []
+    for formatter in [
+        format_sleep_data,
+        format_body_data,
+        format_stress_data,
+        format_training_readiness_data,
+        format_respiration_data,
+        format_fitness_age_data,
+        format_intensity_minutes_data,
+        format_activities_data,
+    ]:
+        section = formatter(data)
+        if section:
+            sections.append(section)
+    return sections
+
+
+def build_health_profile(output_dir: Path) -> None:
+    """Refresh long-term profile files after sync."""
+    script = BASE_DIR / "scripts" / "build_health_profile.py"
+    if not script.exists():
+        return
+    proc = subprocess.run(
+        [sys.executable, str(script), "--health-dir", str(output_dir)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if VERBOSE and proc.stdout:
+        print(proc.stdout.strip(), file=sys.stderr)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip()
+        print(f"Warning: health profile build failed: {err}", file=sys.stderr)
+
+
+def sync_day(client: Garmin, day: date, output_dir: Path, write_raw_json: bool = False) -> None:
     """Sync a single day's data and write the markdown file."""
     day_str = day.isoformat()
     display_date = day.strftime("%B %-d, %Y")
+    if VERBOSE:
+        print(f"  {day_str}: Fetching Garmin API data...")
 
     sections = [f"# Health — {display_date}"]
-
-    sleep = fetch_sleep(client, day_str)
-    if sleep:
-        sections.append(sleep)
-
-    body = fetch_body(client, day_str)
-    if body:
-        sections.append(body)
-
-    stress = fetch_stress(client, day_str)
-    if stress:
-        sections.append(stress)
-
-    readiness = fetch_training_readiness(client, day_str)
-    if readiness:
-        sections.append(readiness)
-
-    respiration = fetch_respiration(client, day_str)
-    if respiration:
-        sections.append(respiration)
-
-    fitness_age = fetch_fitness_age(client, day_str)
-    if fitness_age:
-        sections.append(fitness_age)
-
-    intensity = fetch_intensity_minutes(client, day_str)
-    if intensity:
-        sections.append(intensity)
-
-    activities = fetch_activities(client, day_str)
-    if activities:
-        sections.append(activities)
+    data, errors = collect_daily_data(client, day_str)
+    sections.extend(format_collected_day(data))
 
     if len(sections) == 1:
         print(f"  {day_str}: No data available, skipping.")
+        if write_raw_json and (data or errors):
+            write_private_json(
+                output_dir / "raw" / f"{day_str}.json",
+                {"date": day_str, "fetchedAt": datetime.now().isoformat(timespec="seconds"), "data": data, "errors": errors},
+            )
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{day_str}.md"
     output_file.write_text("\n\n".join(sections) + "\n")
+    if write_raw_json:
+        write_private_json(
+            output_dir / "raw" / f"{day_str}.json",
+            {"date": day_str, "fetchedAt": datetime.now().isoformat(timespec="seconds"), "data": data, "errors": errors},
+        )
     print(f"  {day_str}: Written to {output_file}")
 
 
@@ -1248,10 +1694,29 @@ def main() -> None:
             "getpass prompt or 'keychain' to read macOS Keychain."
         ),
     )
+    parser.add_argument(
+        "--raw-json",
+        action="store_true",
+        default=env_flag("GARMIN_CONNECT_RAW_JSON"),
+        help="Write private raw Garmin API payloads to health/raw/YYYY-MM-DD.json.",
+    )
+    parser.add_argument(
+        "--api-timeout",
+        type=int,
+        default=int(os.environ.get("GARMIN_CONNECT_API_TIMEOUT", "30")),
+        help="Per-request Garmin API timeout in seconds.",
+    )
+    parser.add_argument(
+        "--no-profile",
+        action="store_true",
+        help="Skip rebuilding health/profile.md and health/metrics.json after sync.",
+    )
     args = parser.parse_args()
 
     global VERBOSE
+    global API_TIMEOUT
     VERBOSE = args.verbose
+    API_TIMEOUT = args.api_timeout
     is_cn = args.cn or env_flag("GARMIN_CONNECT_CN")
     use_browser = args.browser or env_flag("GARMIN_CONNECT_BROWSER")
 
@@ -1283,6 +1748,8 @@ def main() -> None:
     if use_browser:
         print("Syncing Garmin Connect from Chrome browser session...")
         sync_days_from_browser(days, output_dir, is_cn=is_cn)
+        if not args.no_profile:
+            build_health_profile(output_dir)
         print("Done.")
         return
 
@@ -1291,8 +1758,10 @@ def main() -> None:
     print(f"Syncing {len(days)} day(s)...")
 
     for day in sorted(days):
-        sync_day(client, day, output_dir)
+        sync_day(client, day, output_dir, write_raw_json=args.raw_json)
 
+    if not args.no_profile:
+        build_health_profile(output_dir)
     print("Done.")
 
 
