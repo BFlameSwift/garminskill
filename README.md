@@ -60,27 +60,54 @@ Sections are only included when data is available.
 
 ### One-time setup
 
-Authenticate and cache OAuth tokens. This only needs to happen once (~1 year token validity). The password is prompted interactively via `getpass` — never echoed to screen or stored in shell history.
+Authenticate and cache local session material. The password is prompted interactively via `getpass` — never echoed to screen or stored in shell history.
 
 ```bash
 uv run scripts/sync_garmin.py --setup --email you@example.com
 ```
 
-For Garmin China accounts, use the China endpoints:
+For Garmin China accounts, use the China web-session API cache:
 
 ```bash
 uv run scripts/sync_garmin.py --setup --email you@example.com --cn
 ```
 
-If Garmin China blocks the non-official API token flow, use the browser path
-instead. It reads the user's already logged-in Chrome Garmin Connect page via
-AppleScript and does not require saving a password or Chrome profile copy:
+On this local OpenClaw setup, the configured Garmin China account can also read
+the setup password from macOS Keychain. Store or refresh the password without
+printing it:
+
+```bash
+python3 scripts/garmin_keychain.py put --account you@example.com --cn
+python3 scripts/garmin_keychain.py status --account you@example.com --cn
+```
+
+Then refresh the Garmin CN API session from Keychain:
+
+```bash
+uv run scripts/sync_garmin.py --setup --email you@example.com --cn --password-source keychain
+```
+
+The plaintext password must not be committed into this skill, OpenClaw config,
+cron payloads, or shell history. See
+`references/garmin-cn-api-runbook.md` for the full local CN API runbook.
+
+For Garmin China, Garmin currently rejects the non-official DI bearer-token
+exchange. The `--cn` setup logs in through Garmin's portal flow once, caches the
+signed-in CN web-session cookies under `~/.garminconnect/`, and subsequent syncs
+read JSON from `https://connect.garmin.cn/gc-api/...`. This is API data, not a
+visible-page scrape.
+
+Use the browser path only as a manual fallback. It reads the user's already
+logged-in Chrome Garmin Connect page via AppleScript and does not require saving
+a password or Chrome profile copy:
 
 ```bash
 uv run scripts/sync_garmin.py --cn --browser
 ```
 
-After setup succeeds, the password is no longer needed. All subsequent syncs use cached tokens only.
+After setup succeeds, the password is no longer needed for normal syncs. Global
+Garmin uses cached DI tokens; Garmin China uses the cached CN web session and
+refreshes it through Garmin SSO cookies when possible.
 
 ### Run it
 
@@ -91,7 +118,7 @@ uv run scripts/sync_garmin.py
 # Sync today using Garmin China endpoints
 uv run scripts/sync_garmin.py --cn
 
-# Sync today from the logged-in Chrome Garmin Connect web UI
+# Manual fallback: sync today from the logged-in Chrome Garmin Connect web UI
 uv run scripts/sync_garmin.py --cn --browser
 
 # Sync a specific date
@@ -114,10 +141,10 @@ ln -s /path/to/garminskill ~/.openclaw/skills/garmin-connect
 
 ### Cron
 
-Schedule the sync to run every morning so your data stays up to date automatically. No credentials needed — the sync uses cached tokens from the one-time setup. OpenClaw's `cron` tool can handle this, or use a system crontab:
+Schedule the API sync to run every morning so your data stays up to date automatically. No credentials needed — the sync uses cached auth material from the one-time setup. For Garmin China, include `--cn`; do not include `--browser` in the scheduled command unless you intentionally want the browser fallback. OpenClaw's `cron` tool can handle this, or use a system crontab:
 
 ```bash
-0 7 * * * uv run /path/to/garminskill/scripts/sync_garmin.py
+0 7 * * * uv run /path/to/garminskill/scripts/sync_garmin.py --cn
 ```
 
 ## Troubleshooting
@@ -146,18 +173,23 @@ Garmin periodically updates its anti-bot measures, which can cause temporary bre
 1. **Update dependencies:** `uv cache clean` then re-run the sync (uv will fetch the latest versions automatically)
 2. **Wait and retry.** Cloudflare blocks are often transient.
 3. **Check the [garminconnect issues page](https://github.com/cyberjunky/python-garminconnect/issues)** — others may be experiencing the same problem.
-4. For Garmin China, use `--cn --browser` if Chrome is already logged in and the API token flow fails.
+4. For Garmin China, the expected API command is `--cn`. It uses `/gc-api` JSON endpoints with the cached CN web session. Use `--cn --browser` only as a manual fallback if Chrome is already logged in and the web-session API path fails.
 
 ### Tokens expired
 
-Cached tokens last about a year. When they expire, the sync will tell you to re-run setup. Just run the setup command again with your email — a new password prompt will appear and fresh tokens will be cached.
+Cached global DI tokens last about a year. Garmin China uses a cached web session: the long-lived SSO cookies may refresh the short-lived `JWT_WEB` session, but if Garmin revokes or expires the session, the sync will tell you to re-run setup. Just run the setup command again with your email — a new password prompt will appear and fresh local auth material will be cached.
 
 ## Auth notes
 
 The script uses [garminconnect](https://github.com/cyberjunky/python-garminconnect)
-for token-based sync, and can also use Chrome AppleScript for Garmin China
-browser-based sync. Authentication is split into two phases:
+for global token-based sync. For Garmin China it uses Garmin's signed-in
+`/gc-api` JSON endpoints with locally cached CN web-session cookies. It can also
+use Chrome AppleScript as a Garmin China fallback, but that is not the default
+source of truth. Authentication is split into two phases:
 
-1. **Setup** (`--setup`): Run once in a terminal to authenticate. `getpass` prompts for the password (never echoed to screen or stored in shell history). OAuth tokens are cached in `~/.garminconnect/` (~1 year validity). The password is used once and then discarded.
-2. **Sync** (default): Uses cached tokens only — no credentials needed. Token refresh is automatic (OAuth1 → OAuth2 exchange, no password required). If tokens expire or are revoked by Garmin, re-run setup.
-3. **Browser sync** (`--browser`): Reads the logged-in Garmin Connect web UI in Chrome and writes the same daily markdown file. This is useful for Garmin China accounts when the non-official API token exchange is blocked.
+1. **Setup** (`--setup`): Run once in a terminal to authenticate. `getpass` prompts for the password (never echoed to screen or stored in shell history). Global OAuth tokens or Garmin China web-session cookies are cached in `~/.garminconnect/`. The password is used once and then discarded.
+2. **Keychain setup** (`--password-source keychain`): Reads the password from
+   macOS Keychain service `openclaw.garmin-connect.cn` and the account email;
+   it does not print the password.
+3. **Sync** (default): Uses cached auth only — no credentials needed. Global token refresh is automatic where Garmin permits it; Garmin China refreshes the signed-in web session where Garmin SSO permits it. If auth expires or is revoked by Garmin, re-run setup.
+4. **Browser sync** (`--browser`): Reads the logged-in Garmin Connect web UI in Chrome and writes the same daily markdown file. This is a fallback for Garmin China accounts when the non-official API token exchange is blocked, not the normal scheduled path.

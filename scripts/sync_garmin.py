@@ -1,10 +1,11 @@
 # /// script
-# requires-python = ">=3.10"
-# dependencies = ["garminconnect>=0.3.2"]
+# requires-python = ">=3.12"
+# dependencies = ["garminconnect>=0.3.3"]
 # ///
 """Sync daily health data from Garmin Connect into markdown files."""
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -14,14 +15,19 @@ import time
 from datetime import datetime, date, timedelta
 from getpass import getpass
 from pathlib import Path
+from typing import Any
 
+import requests
 from garminconnect import Garmin
 from garminconnect import client as garmin_client
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TOKEN_DIR = Path.home() / ".garminconnect"
+CN_WEB_SESSION_FILE = TOKEN_DIR / "garmin_cn_web_session.json"
 VERBOSE = False
+KEYCHAIN_SERVICE_GLOBAL = "openclaw.garmin-connect"
+KEYCHAIN_SERVICE_CN = "openclaw.garmin-connect.cn"
 
 GARMIN_CN_APP = "https://connect.garmin.cn/app"
 GARMIN_GLOBAL_APP = "https://connect.garmin.com/app"
@@ -56,8 +62,55 @@ def env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def keychain_service(is_cn: bool) -> str:
+    """Return the macOS Keychain service name for this Garmin account type."""
+    return KEYCHAIN_SERVICE_CN if is_cn else KEYCHAIN_SERVICE_GLOBAL
+
+
+def read_keychain_password(email: str, is_cn: bool) -> str:
+    """Read a Garmin password from macOS Keychain without printing it."""
+    proc = subprocess.run(
+        [
+            "/usr/bin/security",
+            "find-generic-password",
+            "-s",
+            keychain_service(is_cn),
+            "-a",
+            email,
+            "-w",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "No Garmin password found in macOS Keychain for "
+            f"service={keychain_service(is_cn)!r}, account={email!r}. "
+            "Store it with scripts/garmin_keychain.py put first, or use "
+            "--password-source prompt."
+        )
+    password = proc.stdout.rstrip("\n")
+    if not password:
+        raise RuntimeError("Garmin password in macOS Keychain is empty.")
+    return password
+
+
+def get_setup_password(email: str, is_cn: bool, password_source: str) -> str:
+    """Resolve the password for setup without using command-line arguments."""
+    if password_source == "keychain":
+        return read_keychain_password(email, is_cn)
+    if password_source != "prompt":
+        raise RuntimeError(f"Unsupported password source: {password_source}")
+    password = getpass("Garmin Connect password: ")
+    if not password:
+        print("Error: Password cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+    return password
+
+
 def configure_garmin_region(is_cn: bool) -> None:
-    """Patch garminconnect 0.3.2 globals that are not fully domain-aware."""
+    """Patch garminconnect globals that are not fully domain-aware for CN API sync."""
     if not is_cn:
         return
 
@@ -67,6 +120,275 @@ def configure_garmin_region(is_cn: bool) -> None:
     garmin_client.IOS_SERVICE_URL = "https://connect.garmin.cn/app/"
     garmin_client.MOBILE_SSO_SERVICE_URL = "https://connect.garmin.cn/app/"
     garmin_client.PORTAL_SSO_SERVICE_URL = "https://connect.garmin.cn/app/"
+
+
+def write_secret_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write sensitive session/token material with user-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        path.parent.chmod(0o700)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    except Exception:
+        with contextlib.suppress(Exception):
+            os.close(fd)
+        raise
+    os.replace(tmp, path)
+    with contextlib.suppress(Exception):
+        path.chmod(0o600)
+
+
+def extract_window_json(html: str, name: str) -> Any | None:
+    """Extract a JSON object assigned as window.NAME = ...; from Garmin HTML."""
+    match = re.search(rf"window\.{re.escape(name)}\s*=\s*(.*?);", html, re.S)
+    if not match:
+        return None
+    return json.loads(match.group(1))
+
+
+def parse_cn_modern_state(html: str) -> dict[str, Any]:
+    """Parse signed-in Garmin CN modern app state from HTML."""
+    profile = extract_window_json(html, "VIEWER_SOCIAL_PROFILE")
+    if not isinstance(profile, dict) or not profile.get("displayName"):
+        raise RuntimeError("Garmin CN session is not signed in")
+    csrf_match = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
+    if not csrf_match:
+        raise RuntimeError("Garmin CN session is missing csrf token")
+    return {
+        "csrf": csrf_match.group(1),
+        "profile": profile,
+        "userPreferences": extract_window_json(html, "VIEWER_USERPREFERENCES") or {},
+        "sessionExpires": extract_window_json(html, "SESSION_EXPIRES") or {},
+    }
+
+
+def serialize_cookies(session: Any) -> list[dict[str, Any]]:
+    """Serialize cookies from requests or curl_cffi sessions."""
+    cookies = []
+    jar = getattr(getattr(session, "cookies", None), "jar", None) or getattr(
+        session, "cookies", []
+    )
+    for cookie in jar:
+        domain = getattr(cookie, "domain", "") or ""
+        if "garmin.cn" not in domain:
+            continue
+        cookies.append(
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": domain,
+                "path": getattr(cookie, "path", "/") or "/",
+                "expires": getattr(cookie, "expires", None),
+                "secure": bool(getattr(cookie, "secure", False)),
+            }
+        )
+    return cookies
+
+
+def save_cn_web_session(session: Any, state: dict[str, Any]) -> None:
+    """Persist Garmin CN web-session auth for later /gc-api syncs."""
+    payload = {
+        "kind": "garmin-cn-web-session-v1",
+        "createdAt": datetime.now().isoformat(timespec="seconds"),
+        "csrf": state["csrf"],
+        "sessionExpires": state.get("sessionExpires") or {},
+        "profile": {
+            "displayName": state["profile"].get("displayName"),
+            "profileId": state["profile"].get("profileId"),
+            "garminGUID": state["profile"].get("garminGUID"),
+            "fullName": state["profile"].get("fullName"),
+            "userName": state["profile"].get("userName"),
+        },
+        "userPreferences": state.get("userPreferences") or {},
+        "cookies": serialize_cookies(session),
+    }
+    write_secret_json(CN_WEB_SESSION_FILE, payload)
+
+
+class GarminCnWebClient:
+    """Garmin China client using the signed-in web session's /gc-api JSON API."""
+
+    def __init__(self, session_file: Path = CN_WEB_SESSION_FILE) -> None:
+        self.session_file = session_file
+        self.session = requests.Session()
+        self.csrf = ""
+        self.display_name = ""
+        self.full_name = ""
+        self.unit_system: str | None = None
+        self._load()
+        self.refresh_session()
+
+    def _load(self) -> None:
+        data = json.loads(self.session_file.read_text())
+        if data.get("kind") != "garmin-cn-web-session-v1":
+            raise RuntimeError("Unsupported Garmin CN session cache")
+        for cookie in data.get("cookies") or []:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            domain = cookie.get("domain")
+            if not name or value is None or not domain:
+                continue
+            self.session.cookies.set(
+                name,
+                value,
+                domain=domain,
+                path=cookie.get("path") or "/",
+            )
+        self._apply_state(data)
+
+    def _apply_state(self, state: dict[str, Any]) -> None:
+        self.csrf = state.get("csrf") or self.csrf
+        profile = state.get("profile") or {}
+        self.display_name = profile.get("displayName") or self.display_name
+        self.full_name = profile.get("fullName") or self.full_name
+        preferences = state.get("userPreferences") or {}
+        user_data = preferences.get("userData") if isinstance(preferences, dict) else {}
+        if isinstance(user_data, dict):
+            self.unit_system = user_data.get("measurementSystem") or self.unit_system
+
+    def refresh_session(self) -> None:
+        response = self.session.get(
+            "https://connect.garmin.cn/modern/",
+            headers={"Accept": "text/html,application/xhtml+xml"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        state = parse_cn_modern_state(response.text)
+        save_cn_web_session(self.session, state)
+        self._apply_state(state)
+
+    def connectapi(self, path: str, **kwargs: Any) -> Any:
+        url = f"https://connect.garmin.cn/gc-api/{path.lstrip('/')}"
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://connect.garmin.cn",
+            "Referer": "https://connect.garmin.cn/modern/",
+            "Connect-Csrf-Token": self.csrf,
+        }
+        response = self.session.get(
+            url,
+            headers=headers,
+            params=kwargs.get("params"),
+            timeout=kwargs.get("timeout", 30),
+        )
+        if response.status_code in {401, 403}:
+            self.refresh_session()
+            headers["Connect-Csrf-Token"] = self.csrf
+            response = self.session.get(
+                url,
+                headers=headers,
+                params=kwargs.get("params"),
+                timeout=kwargs.get("timeout", 30),
+            )
+        if response.status_code == 204:
+            return {}
+        if response.status_code >= 400:
+            raise RuntimeError(f"Garmin CN API {response.status_code}: {response.text[:300]}")
+        return response.json()
+
+    def get_sleep_data(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(
+            f"/wellness-service/wellness/dailySleepData/{self.display_name}",
+            params={"date": cdate, "nonSleepBufferMinutes": 60},
+        )
+
+    def get_user_summary(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(
+            f"/usersummary-service/usersummary/daily/{self.display_name}",
+            params={"calendarDate": cdate},
+        )
+
+    def get_heart_rates(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(
+            f"/wellness-service/wellness/dailyHeartRate/{self.display_name}",
+            params={"date": cdate},
+        )
+
+    def get_body_battery(self, startdate: str, enddate: str | None = None) -> list[dict[str, Any]]:
+        return self.connectapi(
+            "/wellness-service/wellness/bodyBattery/reports/daily",
+            params={"startDate": startdate, "endDate": enddate or startdate},
+        )
+
+    def get_hrv_data(self, cdate: str) -> dict[str, Any] | None:
+        return self.connectapi(f"/hrv-service/hrv/{cdate}")
+
+    def get_spo2_data(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(f"/wellness-service/wellness/daily/spo2/{cdate}")
+
+    def get_daily_weigh_ins(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(
+            f"/weight-service/weight/dayview/{cdate}",
+            params={"includeAll": "true"},
+        )
+
+    def get_all_day_stress(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(f"/wellness-service/wellness/dailyStress/{cdate}")
+
+    def get_training_readiness(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(f"/metrics-service/metrics/trainingreadiness/{cdate}")
+
+    def get_respiration_data(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(f"/wellness-service/wellness/daily/respiration/{cdate}")
+
+    def get_fitnessage_data(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(f"/fitnessage-service/fitnessage/{cdate}")
+
+    def get_intensity_minutes_data(self, cdate: str) -> dict[str, Any]:
+        return self.connectapi(f"/wellness-service/wellness/daily/im/{cdate}")
+
+    def get_activities_by_date(
+        self,
+        startdate: str,
+        enddate: str | None = None,
+        activitytype: str | None = None,
+        sortorder: str | None = None,
+    ) -> list[dict[str, Any]]:
+        activities: list[dict[str, Any]] = []
+        start = 0
+        limit = 20
+        while True:
+            params: dict[str, str] = {
+                "startDate": startdate,
+                "start": str(start),
+                "limit": str(limit),
+            }
+            if enddate:
+                params["endDate"] = enddate
+            if activitytype:
+                params["activityType"] = activitytype
+            if sortorder:
+                params["sortOrder"] = sortorder
+            batch = self.connectapi(
+                "/activitylist-service/activities/search/activities",
+                params=params,
+            )
+            if not batch:
+                break
+            activities.extend(batch)
+            start += limit
+        return activities
+
+
+def setup_cn_web_session(email: str, password_source: str = "prompt") -> None:
+    """Authenticate Garmin China via portal session and cache /gc-api cookies."""
+    password = get_setup_password(email, True, password_source)
+    client = garmin_client.Client(domain="garmin.cn")
+    try:
+        client._portal_web_login_cffi(email, password)
+    except Exception:
+        client._portal_web_login_requests(email, password)
+    response = client.cs.get("https://connect.garmin.cn/modern/", timeout=30)
+    response.raise_for_status()
+    state = parse_cn_modern_state(response.text)
+    save_cn_web_session(client.cs, state)
+    print(f"Success! Garmin CN web-session API cache saved in {CN_WEB_SESSION_FILE}")
+    print("You can now run the sync command without credentials.")
 
 
 def applescript_quote(value: str) -> str:
@@ -288,13 +610,14 @@ def sync_day_from_browser(day: date, output_dir: Path, is_cn: bool) -> None:
     print(f"  {day_str}: Written to {output_file}")
 
 
-def setup(email: str, is_cn: bool = False) -> None:
+def setup(email: str, is_cn: bool = False, password_source: str = "prompt") -> None:
     """One-time interactive setup: authenticate with email/password and cache tokens."""
+    if is_cn:
+        setup_cn_web_session(email, password_source=password_source)
+        return
+
     configure_garmin_region(is_cn)
-    password = getpass("Garmin Connect password: ")
-    if not password:
-        print("Error: Password cannot be empty.", file=sys.stderr)
-        sys.exit(1)
+    password = get_setup_password(email, is_cn, password_source)
 
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     tokenstore = str(TOKEN_DIR)
@@ -350,6 +673,26 @@ def setup(email: str, is_cn: bool = False) -> None:
 
 def authenticate(is_cn: bool = False) -> Garmin:
     """Authenticate with Garmin Connect using cached tokens only."""
+    if is_cn:
+        if not CN_WEB_SESSION_FILE.exists():
+            print(
+                "Error: No Garmin CN web-session API cache found.\n"
+                "Run setup first:\n\n"
+                "  uv run scripts/sync_garmin.py --setup --email you@example.com --cn\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            return GarminCnWebClient()  # type: ignore[return-value]
+        except Exception as e:
+            print(
+                f"Error: Garmin CN cached web session is not usable: {e}\n"
+                "Run setup again:\n\n"
+                "  uv run scripts/sync_garmin.py --setup --email you@example.com --cn\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     configure_garmin_region(is_cn)
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     tokenstore = str(TOKEN_DIR)
@@ -896,6 +1239,15 @@ def main() -> None:
         default="health",
         help="Output directory for markdown files (relative to skill base dir).",
     )
+    parser.add_argument(
+        "--password-source",
+        choices=["prompt", "keychain"],
+        default=os.environ.get("GARMIN_CONNECT_PASSWORD_SOURCE", "prompt"),
+        help=(
+            "Password source for --setup. Use 'prompt' for an interactive "
+            "getpass prompt or 'keychain' to read macOS Keychain."
+        ),
+    )
     args = parser.parse_args()
 
     global VERBOSE
@@ -907,7 +1259,7 @@ def main() -> None:
         if not args.email:
             print("Error: --email is required with --setup.", file=sys.stderr)
             sys.exit(1)
-        setup(args.email, is_cn=is_cn)
+        setup(args.email, is_cn=is_cn, password_source=args.password_source)
         return
 
     # Always resolve output-dir relative to the skill's base directory, not CWD
