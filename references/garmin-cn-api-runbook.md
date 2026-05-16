@@ -114,6 +114,13 @@ cd /Users/liyu/.openclaw/skills/garmin-connect
 uv run scripts/sync_garmin.py --cn --days 30 --verbose --raw-json
 ```
 
+Robust scheduled sync with one Keychain-backed session refresh retry:
+
+```bash
+cd /Users/liyu/.openclaw/skills/garmin-connect
+(/usr/local/bin/uv run scripts/sync_garmin.py --cn --days 45 --verbose --raw-json --api-timeout 45 || (/usr/local/bin/uv run scripts/sync_garmin.py --setup --email you@example.com --cn --password-source keychain && /usr/local/bin/uv run scripts/sync_garmin.py --cn --days 45 --verbose --raw-json --api-timeout 45))
+```
+
 Backfill longer history for trend management:
 
 ```bash
@@ -122,8 +129,12 @@ uv run scripts/sync_garmin.py --cn --days 180 --verbose --raw-json
 ```
 
 For a full-year baseline, use `--days 365` if Garmin rate limits are not
-triggered. If the backfill is interrupted, rerun the same command; existing
-daily files are overwritten with fresh API data.
+triggered. For this local health-management setup, keep about two years of local
+history when possible. The verified coverage target is 730 continuous days
+through today, with both `health/YYYY-MM-DD.md` and
+`health/raw/YYYY-MM-DD.json` present for each date. If a long backfill is
+interrupted, rerun the same command or the missing date range; existing daily
+files are overwritten with fresh API data.
 
 Expected success contains:
 
@@ -143,6 +154,13 @@ Health management reading order for the Garmin agent:
 3. Read specific `health/YYYY-MM-DD.md` files for daily summaries.
 4. Inspect `health/raw/YYYY-MM-DD.json` only when the markdown omits a needed Garmin field.
 
+Nightly reports should verify that `health/profile.md` and `health/metrics.json`
+cover today's date. When two-year coverage is available, segment the report by
+latest day, 7d, 30d, 90d, 365d, and all available history instead of treating
+the latest day as the whole story. If the sync command fails but the profile is
+already current through today, state that the report is based on current local
+data and do not claim new health data is missing.
+
 ## OpenClaw Cron Integration
 
 The Garmin cron jobs should run as `agentId=garmin` with `toolsAllow=["exec"]`. The Garmin agent must keep a `full` tool profile because the cron task needs `exec`.
@@ -151,6 +169,11 @@ Current local jobs:
 
 - `61db6bed-f7ed-464a-bc58-0bc6330e97cb` — `Garmin daily health sync`, 07:00 Asia/Shanghai, syncs recent data with `--raw-json`, refreshes long-term profile, no Feishu delivery.
 - `f35c6610-f44e-4d28-aeab-2f9216671a09` — `Garmin nightly analysis`, 22:00 Asia/Shanghai, syncs a recent window, reads `health/profile.md`, and sends the report to Feishu using the `garmin` account.
+
+Both jobs should use the robust sync command above or equivalent logic: try the
+cached CN API session first, refresh from Keychain on `401`/`403`, and retry
+once. Do not schedule `--browser`; browser sync is only a manual owner-approved
+fallback.
 
 Verify latest runs:
 
@@ -193,3 +216,11 @@ uv run scripts/sync_garmin.py --setup --email you@example.com --cn --password-so
 ```
 
 5. Re-run API sync and only use `--browser` if API refresh still fails and the owner explicitly approves browser fallback.
+6. If a nightly report says data was stale, verify the actual local profile
+   coverage before trusting the wording:
+
+```bash
+cd /Users/liyu/.openclaw/skills/garmin-connect
+jq '.coverage, .latest.date, (.records | length)' health/metrics.json
+sed -n '1,40p' health/profile.md
+```

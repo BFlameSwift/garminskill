@@ -108,6 +108,14 @@ Sync richer local data for deeper health management:
 uv run {baseDir}/scripts/sync_garmin.py --cn --days 30 --raw-json
 ```
 
+For scheduled Garmin China syncs, prefer a robust API command that refreshes
+the CN web-session from macOS Keychain and retries once if the cached session is
+expired:
+
+```bash
+cd {baseDir} && (/usr/local/bin/uv run scripts/sync_garmin.py --cn --days 45 --verbose --raw-json --api-timeout 45 || (/usr/local/bin/uv run scripts/sync_garmin.py --setup --email you@example.com --cn --password-source keychain && /usr/local/bin/uv run scripts/sync_garmin.py --cn --days 45 --verbose --raw-json --api-timeout 45))
+```
+
 `--raw-json` writes private daily API snapshots under
 `{baseDir}/health/raw/YYYY-MM-DD.json`; use it for recent days or backfills
 where detailed review may matter. Normal syncs also refresh the long-term
@@ -127,6 +135,21 @@ For long-term health management, read in this order:
 If a requested date is missing, run the sync command for that date first. If the
 question is about baseline, trend, recovery, or health management over time,
 refresh a larger window first, such as `--days 30`, `--days 90`, or `--days 365`.
+On this local setup, the desired Garmin management baseline is two years through
+today when available. Reports should compare the latest day against 7-day,
+30-day, 90-day, 365-day, and all-available rolling windows rather than using
+only yesterday or a single recent week.
+
+For nightly reports and health-management answers, structure the interpretation
+by time horizon:
+
+- Latest day: what changed today and whether the data is fresh.
+- 7-day: acute sleep/recovery/training load.
+- 30-day: recent habit and recovery direction.
+- 90-day: medium-term training and lifestyle trend.
+- 365-day: seasonal baseline.
+- All available data, normally about 730 days: long-term baseline and risk
+  pattern.
 
 ## Dependencies
 
@@ -149,4 +172,4 @@ password on the command line.
 
 ## Cron Setup
 
-Schedule the sync script to run every morning using OpenClaw's `cron` tool so your health data stays up to date automatically. No environment variables or credentials are needed — the sync uses cached tokens from the one-time setup. For Garmin China, the cron command should normally use `--cn --raw-json` for richer daily records; keep `--browser` as a manual fallback, not the default scheduled path. The nightly analysis job should read `health/profile.md` before daily files so feedback stays longitudinal rather than single-day only.
+Schedule the sync script to run every morning using OpenClaw's `cron` tool so your health data stays up to date automatically. No environment variables or credentials are needed — the sync uses cached tokens from the one-time setup. For Garmin China, the cron command should normally use `--cn --raw-json` for richer daily records and should retry once with `--setup --password-source keychain` when the cached CN web session expires or returns `401`/`403`. Keep `--browser` as a manual fallback, not the default scheduled path. The nightly analysis job should read `health/profile.md` and `health/metrics.json` before daily files so feedback stays longitudinal and segmented by latest day, 7d, 30d, 90d, 365d, and all available history.
