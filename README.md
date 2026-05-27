@@ -144,6 +144,30 @@ Long-term profile files are rebuilt after sync:
 
 Use `--no-profile` only when you intentionally want to skip profile rebuilds.
 
+### Running report context
+
+For daily health reports, especially after a run, build a compact running
+context from the local health files:
+
+```bash
+python3 scripts/build_running_context.py --days 90 --pretty
+```
+
+The helper reads `health/metrics.json` and `health/raw/*.json` and returns:
+
+- the latest day's running activities and the main run's distance, duration,
+  pace, average/max HR, cadence, power, training effect, VO2 max, and intensity
+  class;
+- calendar-week, rolling-7-day, calendar-month, and rolling-30-day mileage;
+- comparisons against the prior 5 runs, last-30-day hard workouts, and
+  last-30-day normal/easy workouts;
+- same-day recovery context from sleep score, HRV, resting HR, Body Battery,
+  and Training Readiness.
+
+Use this output in the Garmin nightly report before writing subjective training
+feedback. If the latest day has no run, use the volume fields only as load
+context.
+
 ### Install as an OpenClaw skill
 
 ```bash

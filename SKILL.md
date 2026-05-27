@@ -1,6 +1,6 @@
 ---
 name: garmin-pulse
-version: 1.5.0
+version: 1.6.0
 description: Use when the user asks about Garmin Connect, Garmin health data, sleep, activities, running, heart rate, stress, body battery, HRV, SpO2, weight, long-term health trends, or whether Garmin data is connected. Syncs daily health and fitness data into markdown files and maintains a long-term local health profile.
 homepage: https://github.com/freakyflow/garminskill
 metadata: {"openclaw":{"emoji":"💪","requires":{"bins":["uv"]},"install":[{"id":"uv","kind":"brew","formula":"uv","bins":["uv"],"label":"Install uv via Homebrew"}]}}
@@ -150,6 +150,46 @@ by time horizon:
 - 365-day: seasonal baseline.
 - All available data, normally about 730 days: long-term baseline and risk
   pattern.
+
+### Running-aware daily reports
+
+For any daily/nightly Garmin report, first check whether the latest day includes
+a running activity. The deterministic running context helper should be used
+before writing the report:
+
+```bash
+python3 {baseDir}/scripts/build_running_context.py --days 90 --pretty
+```
+
+If `latestDayRunning.hasRun` is true, include a dedicated running workout
+section. Base it on `latestDayRunning.mainRun`, `latestDayRunning.allRuns`,
+`volume`, and `comparisons`; if raw activity data is available, do not infer
+workout details from total daily distance alone.
+
+The running section should cover:
+
+- Session content: run name/type, start time if useful, distance, duration,
+  pace, average/max heart rate, cadence, power, aerobic/anaerobic training
+  effect, VO2 max, and the helper's intensity class (`easy`, `moderate`,
+  `hard`) when present.
+- Body state during the run: interpret average/max HR together with the same
+  day's sleep score, HRV, resting HR, Body Battery, Training Readiness, and
+  recent training load. Flag possible fatigue when HR is high for a normal pace
+  or when readiness/body battery/HRV are poor.
+- Recent comparison: compare the main run against prior 5 runs and the last
+  30 days; distinguish hard workouts from normal/easy runs. Lower HR at a
+  similar or faster pace is a positive efficiency signal; higher HR at a
+  slower or similar pace is a fatigue/heat/stress signal unless the workout is
+  clearly intentional intensity.
+- Load context: always report calendar-week mileage, rolling-7-day mileage,
+  calendar-month mileage, and rolling-30-day mileage, plus run days and the
+  count of hard/moderate/easy runs when available.
+- Coaching output: give 2-4 concrete next actions that connect recovery and
+  training load, such as easy-run recommendation, rest, aerobic base work,
+  intensity spacing, or warning against stacking hard sessions.
+
+If there was no run on the latest day, keep the report's activity section brief
+and use the helper's volume fields only as training-load context.
 
 ## Dependencies
 

@@ -1,5 +1,6 @@
 health/*.md
 health/*.json
 health/raw/
+health/monthly/
 health/backfill*.log
 .claude/
