@@ -163,6 +163,9 @@ The helper reads `health/metrics.json` and `health/raw/*.json` and returns:
   last-30-day normal/easy workouts;
 - same-day recovery context from sleep score, HRV, resting HR, Body Battery,
   and Training Readiness.
+- `trainingAssessment`, which pre-computes training content, intensity,
+  body-state flags, heart-rate/performance notes, workout-quality verdict,
+  likely benefits, and recovery advice.
 
 Use this output in the Garmin nightly report before writing subjective training
 feedback. If the latest day has no run, use the volume fields only as load

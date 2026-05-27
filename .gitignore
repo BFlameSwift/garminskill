@@ -4,3 +4,5 @@ health/raw/
 health/monthly/
 health/backfill*.log
 .claude/
+__pycache__/
+scripts/__pycache__/

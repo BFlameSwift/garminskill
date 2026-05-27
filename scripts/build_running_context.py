@@ -278,6 +278,264 @@ def comparison(target: RunActivity | None, candidates: list[RunActivity]) -> dic
     return result
 
 
+def baseline_metric(metrics: dict[str, Any], window_name: str, field: str) -> Any:
+    windows = metrics.get("windows")
+    if not isinstance(windows, dict):
+        return None
+    window_data = windows.get(window_name)
+    if not isinstance(window_data, dict):
+        return None
+    return window_data.get(field)
+
+
+def build_recovery_baselines(metrics: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    fields = [
+        "sleep_score",
+        "sleep_minutes",
+        "resting_hr",
+        "hrv",
+        "body_battery",
+        "training_readiness",
+    ]
+    return {
+        window: {field: baseline_metric(metrics, window, field) for field in fields}
+        for window in ["7d", "30d", "90d"]
+    }
+
+
+def training_content(run: RunActivity | None) -> str | None:
+    if run is None:
+        return None
+    label = (run.training_effect_label or "").upper()
+    if run.intensity == "hard" and ("VO2" in label or (run.anaerobic_te or 0) >= 3):
+        return "VO2max/速度耐力刺激课"
+    if run.intensity == "hard" and (run.aerobic_te or 0) >= 4:
+        return "高强度有氧-无氧混合课"
+    if run.intensity == "moderate":
+        return "中等强度有氧或节奏控制课"
+    if run.intensity == "easy":
+        return "轻松跑/恢复跑"
+    return "普通跑步训练"
+
+
+def body_state(latest_health: dict[str, Any], baselines: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    readiness = as_float(latest_health.get("training_readiness"))
+    sleep_score = as_float(latest_health.get("sleep_score"))
+    hrv = as_float(latest_health.get("hrv"))
+    resting_hr = as_float(latest_health.get("resting_hr"))
+    body_battery = as_float(latest_health.get("body_battery"))
+    base30 = baselines.get("30d", {})
+    notes: list[str] = []
+    flags: list[str] = []
+
+    if readiness is not None and readiness <= 20:
+        flags.append("low_training_readiness")
+        notes.append(f"Training Readiness {readiness:g}，身体不适合叠加强刺激。")
+    elif readiness is not None and readiness >= 70:
+        notes.append(f"Training Readiness {readiness:g}，恢复状态支持训练。")
+
+    if sleep_score is not None and sleep_score >= 85:
+        notes.append(f"睡眠分 {sleep_score:g}，睡眠质量本身较好。")
+    elif sleep_score is not None and sleep_score < 75:
+        flags.append("low_sleep_score")
+        notes.append(f"睡眠分 {sleep_score:g} 偏低，训练承受力可能下降。")
+
+    hrv30 = as_float(base30.get("hrv"))
+    if hrv is not None and hrv30 is not None:
+        delta_hrv = round(hrv - hrv30, 1)
+        if delta_hrv <= -3:
+            flags.append("hrv_below_30d")
+            notes.append(f"HRV {hrv:g} ms，比 30 天均值低 {abs(delta_hrv):g} ms。")
+        elif delta_hrv >= 3:
+            notes.append(f"HRV {hrv:g} ms，比 30 天均值高 {delta_hrv:g} ms。")
+
+    rhr30 = as_float(base30.get("resting_hr"))
+    if resting_hr is not None and rhr30 is not None:
+        delta_rhr = round(resting_hr - rhr30, 1)
+        if delta_rhr >= 3:
+            flags.append("resting_hr_above_30d")
+            notes.append(f"静息心率 {resting_hr:g} bpm，比 30 天均值高 {delta_rhr:g} bpm。")
+        elif delta_rhr <= -3:
+            notes.append(f"静息心率 {resting_hr:g} bpm，比 30 天均值低 {abs(delta_rhr):g} bpm。")
+
+    if body_battery is not None and body_battery < 30:
+        flags.append("low_body_battery")
+        notes.append(f"Body Battery {body_battery:g} 偏低。")
+
+    return {
+        "status": "caution" if flags else "ok",
+        "flags": flags,
+        "notes": notes,
+    }
+
+
+def heart_performance_state(
+    run: RunActivity | None,
+    comparisons: dict[str, Any],
+) -> dict[str, Any]:
+    if run is None:
+        return {"status": "no_run", "notes": []}
+    notes: list[str] = []
+    flags: list[str] = []
+    prior5 = comparisons.get("latestVsPrior5Runs") or {}
+    hard30 = comparisons.get("latestVsPrior30dHardRuns") or {}
+    normal30 = comparisons.get("latestVsPrior30dNormalRuns") or {}
+
+    if run.avg_hr is not None and run.pace:
+        notes.append(f"本次主跑均心 {run.avg_hr:g} bpm，配速 {run.pace}。")
+    if run.max_hr is not None and run.max_hr >= 190:
+        flags.append("very_high_max_hr")
+        notes.append(f"最大心率 {run.max_hr:g} bpm，属于很高的心血管刺激。")
+
+    prior5_pace = as_float(prior5.get("target_pace_delta_sec_per_km"))
+    prior5_hr = as_float(prior5.get("target_avg_hr_delta"))
+    if prior5_pace is not None and prior5_hr is not None:
+        if prior5_pace < -5 and prior5_hr <= 3:
+            notes.append("相比最近几次，配速更快且心率没有明显上扬，是效率进步信号。")
+        elif prior5_pace < -5 and prior5_hr > 5:
+            flags.append("higher_hr_for_faster_pace")
+            notes.append("相比最近几次，配速更快但均心也明显更高，更像主动强度课而不是轻松效率提升。")
+        elif prior5_pace >= -5 and prior5_hr > 5:
+            flags.append("higher_hr_without_pace_gain")
+            notes.append("相比最近几次，配速没有明显更快但心率更高，需要警惕疲劳、热或恢复不足。")
+
+    hard_pace = as_float(hard30.get("target_pace_delta_sec_per_km"))
+    hard_hr = as_float(hard30.get("target_avg_hr_delta"))
+    if hard_pace is not None and hard_hr is not None:
+        if hard_pace > 10 and hard_hr < 0:
+            notes.append("相对近 30 天强度课，本次配速更慢但均心略低，更偏高负荷有氧/VO2 刺激，不是最快的一类质量课。")
+        elif hard_pace <= 0 and hard_hr <= 0:
+            notes.append("相对近 30 天强度课，本次在接近或更快配速下心率不高，是较好的表现信号。")
+
+    normal_pace = as_float(normal30.get("target_pace_delta_sec_per_km"))
+    normal_hr = as_float(normal30.get("target_avg_hr_delta"))
+    if normal_pace is not None and normal_hr is not None and normal_hr > 8:
+        flags.append("much_higher_than_normal_hr")
+        notes.append("相对近 30 天普通训练，本次心率明显更高，不能按普通训练恢复消耗来处理。")
+
+    return {
+        "status": "watch" if flags else "positive",
+        "flags": flags,
+        "notes": notes,
+    }
+
+
+def training_quality(
+    run: RunActivity | None,
+    body: dict[str, Any],
+    heart: dict[str, Any],
+    volume: dict[str, Any],
+) -> dict[str, Any]:
+    if run is None:
+        return {"verdict": "no_run", "notes": []}
+    notes: list[str] = []
+    benefits: list[str] = []
+    concerns: list[str] = []
+
+    if run.intensity == "hard":
+        benefits.append("强度刺激明确，有助于提升 VO2max、速度耐力和高心率区间耐受。")
+    elif run.intensity == "moderate":
+        benefits.append("中等强度有氧刺激，有助于维持节奏能力和有氧负荷。")
+    else:
+        benefits.append("低强度活动有助于恢复、跑姿维持和基础有氧。")
+
+    if run.aerobic_te is not None and run.aerobic_te >= 4:
+        benefits.append(f"有氧训练效果 {run.aerobic_te:g}，对有氧能力有明显刺激。")
+    if run.anaerobic_te is not None and run.anaerobic_te >= 2:
+        benefits.append(f"无氧训练效果 {run.anaerobic_te:g}，有速度/变速刺激收益。")
+
+    body_flags = set(body.get("flags") or [])
+    heart_flags = set(heart.get("flags") or [])
+    hard_week = (volume.get("rolling7d") or {}).get("hard_count")
+    if body_flags & {"low_training_readiness", "low_body_battery", "hrv_below_30d"}:
+        concerns.append("恢复指标不支持继续叠加强度，本次课有效但恢复成本偏高。")
+    if "higher_hr_without_pace_gain" in heart_flags or "much_higher_than_normal_hr" in heart_flags:
+        concerns.append("心率相对普通训练偏高，需防止把强度课误判成常规训练。")
+    if isinstance(hard_week, int) and hard_week >= 2:
+        concerns.append(f"近 7 天已有 {hard_week} 次 hard 跑步，强度密度偏高。")
+
+    if concerns:
+        verdict = "有效但恢复风险偏高"
+    elif run.intensity == "hard":
+        verdict = "高质量强度课"
+    elif run.intensity == "moderate":
+        verdict = "合格的有氧/节奏课"
+    else:
+        verdict = "合格的恢复课"
+
+    notes.append(f"训练内容判断：{training_content(run)}。")
+    notes.append(f"训练质量判断：{verdict}。")
+    return {
+        "verdict": verdict,
+        "notes": notes,
+        "benefits": benefits,
+        "concerns": concerns,
+    }
+
+
+def recovery_advice(run: RunActivity | None, body: dict[str, Any], volume: dict[str, Any]) -> list[str]:
+    if run is None:
+        return []
+    advice: list[str] = []
+    body_flags = set(body.get("flags") or [])
+    hard_week = (volume.get("rolling7d") or {}).get("hard_count")
+    if run.intensity == "hard" or body_flags:
+        advice.append("未来 24-48 小时避免再次强刺激，优先休息、散步或 Z1/Z2 轻松跑。")
+    if body_flags & {"low_training_readiness", "low_body_battery"}:
+        advice.append("等 Training Readiness 和 Body Battery 明显回升后，再安排间歇、节奏或 VO2max 课。")
+    if isinstance(hard_week, int) and hard_week >= 2:
+        advice.append("本周强度课已经不少，下一次质量课前至少插入 1-2 天低强度恢复。")
+    if run.intensity == "easy" and not body_flags:
+        advice.append("如果主观疲劳低，明天可以维持轻松有氧或短技术跑。")
+    if not advice:
+        advice.append("明天以低到中等强度有氧为主，观察晨脉、HRV 和腿部疲劳再决定是否加量。")
+    return advice
+
+
+def build_training_assessment(
+    latest_main_run: RunActivity | None,
+    latest_health: dict[str, Any],
+    baselines: dict[str, dict[str, Any]],
+    comparisons: dict[str, Any],
+    volume: dict[str, Any],
+) -> dict[str, Any]:
+    if latest_main_run is None:
+        return {
+            "hasRun": False,
+            "summary": "latest day has no running activity",
+            "requiredReportAngles": [],
+        }
+    body = body_state(latest_health, baselines)
+    heart = heart_performance_state(latest_main_run, comparisons)
+    quality = training_quality(latest_main_run, body, heart, volume)
+    return {
+        "hasRun": True,
+        "trainingContent": training_content(latest_main_run),
+        "trainingIntensity": {
+            "class": latest_main_run.intensity,
+            "aerobicTrainingEffect": latest_main_run.aerobic_te,
+            "anaerobicTrainingEffect": latest_main_run.anaerobic_te,
+            "label": latest_main_run.training_effect_label,
+        },
+        "bodyState": body,
+        "heartAndPerformance": heart,
+        "trainingQuality": quality,
+        "benefits": quality["benefits"],
+        "recoveryAdvice": recovery_advice(latest_main_run, body, volume),
+        "requiredReportAngles": [
+            "训练内容",
+            "训练强度",
+            "最近训练课背景",
+            "身体状态",
+            "心率状态",
+            "运动表现",
+            "是否是好的训练课",
+            "训练收益",
+            "恢复建议",
+        ],
+    }
+
+
 def compact_run(run: RunActivity | None) -> dict[str, Any] | None:
     if run is None:
         return None
@@ -307,6 +565,34 @@ def build_context(health_dir: Path, days: int) -> dict[str, Any]:
 
     week_start = latest_day - timedelta(days=latest_day.weekday())
     month_start = latest_day.replace(day=1)
+    baselines = build_recovery_baselines(metrics)
+    volume = {
+        "calendarWeek": period_summary(runs, week_start, latest_day),
+        "rolling7d": period_summary(runs, latest_day - timedelta(days=6), latest_day),
+        "calendarMonth": period_summary(runs, month_start, latest_day),
+        "rolling30d": period_summary(runs, latest_day - timedelta(days=29), latest_day),
+    }
+    comparisons = {
+        "latestVsPrior5Runs": comparison(latest_main_run, prior_5),
+        "latestVsPrior30dRuns": comparison(latest_main_run, prior_30),
+        "latestVsPrior30dHardRuns": comparison(latest_main_run, prior_30_hard),
+        "latestVsPrior30dNormalRuns": comparison(latest_main_run, prior_30_normal),
+    }
+    latest_health_context = {
+        key: latest_health.get(key)
+        for key in [
+            "sleep_minutes",
+            "sleep_score",
+            "resting_hr",
+            "max_hr",
+            "hrv",
+            "body_battery",
+            "training_readiness",
+            "intensity_total",
+            "activity_count",
+            "activities",
+        ]
+    }
     context = {
         "generatedAt": datetime.now().isoformat(timespec="seconds"),
         "source": {
@@ -316,21 +602,8 @@ def build_context(health_dir: Path, days: int) -> dict[str, Any]:
             "coverage": coverage,
         },
         "latestDate": latest_date_raw,
-        "latestHealth": {
-            key: latest_health.get(key)
-            for key in [
-                "sleep_minutes",
-                "sleep_score",
-                "resting_hr",
-                "max_hr",
-                "hrv",
-                "body_battery",
-                "training_readiness",
-                "intensity_total",
-                "activity_count",
-                "activities",
-            ]
-        },
+        "latestHealth": latest_health_context,
+        "recoveryBaselines": baselines,
         "latestDayRunning": {
             "hasRun": bool(latest_day_runs),
             "runCount": len(latest_day_runs),
@@ -338,25 +611,23 @@ def build_context(health_dir: Path, days: int) -> dict[str, Any]:
             "mainRun": compact_run(latest_main_run),
             "allRuns": [compact_run(run) for run in latest_day_runs],
         },
-        "volume": {
-            "calendarWeek": period_summary(runs, week_start, latest_day),
-            "rolling7d": period_summary(runs, latest_day - timedelta(days=6), latest_day),
-            "calendarMonth": period_summary(runs, month_start, latest_day),
-            "rolling30d": period_summary(runs, latest_day - timedelta(days=29), latest_day),
-        },
+        "volume": volume,
         "recentRuns": [compact_run(run) for run in runs[-10:]],
-        "comparisons": {
-            "latestVsPrior5Runs": comparison(latest_main_run, prior_5),
-            "latestVsPrior30dRuns": comparison(latest_main_run, prior_30),
-            "latestVsPrior30dHardRuns": comparison(latest_main_run, prior_30_hard),
-            "latestVsPrior30dNormalRuns": comparison(latest_main_run, prior_30_normal),
-        },
+        "comparisons": comparisons,
+        "trainingAssessment": build_training_assessment(
+            latest_main_run,
+            latest_health_context,
+            baselines,
+            comparisons,
+            volume,
+        ),
         "reportGuidance": [
             "If latestDayRunning.hasRun is true, include a dedicated running workout section.",
             "Describe the main run's distance, duration, pace, average/max HR, cadence, power, aerobic/anaerobic effect, and intensity class when present.",
             "Compare the main run with prior 5 runs and 30-day hard/normal baselines; lower HR at similar/faster pace is a positive efficiency signal, while higher HR at slower/similar pace can indicate fatigue, heat, stress, or insufficient recovery.",
             "Always mention calendarWeek.distance_km and calendarMonth.distance_km, and use rolling7d/rolling30d for short-term load context.",
             "Interpret run HR together with latestHealth training_readiness, sleep_score, hrv, resting_hr, and body_battery.",
+            "Use trainingAssessment to explicitly cover training content, intensity, recent workout context, body state, heart-rate response, performance, workout quality, benefits, and recovery advice.",
         ],
     }
     return context

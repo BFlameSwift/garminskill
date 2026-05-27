@@ -1,6 +1,6 @@
 ---
 name: garmin-pulse
-version: 1.6.0
+version: 1.6.1
 description: Use when the user asks about Garmin Connect, Garmin health data, sleep, activities, running, heart rate, stress, body battery, HRV, SpO2, weight, long-term health trends, or whether Garmin data is connected. Syncs daily health and fitness data into markdown files and maintains a long-term local health profile.
 homepage: https://github.com/freakyflow/garminskill
 metadata: {"openclaw":{"emoji":"💪","requires":{"bins":["uv"]},"install":[{"id":"uv","kind":"brew","formula":"uv","bins":["uv"],"label":"Install uv via Homebrew"}]}}
@@ -166,12 +166,17 @@ section. Base it on `latestDayRunning.mainRun`, `latestDayRunning.allRuns`,
 `volume`, and `comparisons`; if raw activity data is available, do not infer
 workout details from total daily distance alone.
 
-The running section should cover:
+The running section should cover `trainingAssessment` first, then the raw
+activity metrics:
 
 - Session content: run name/type, start time if useful, distance, duration,
   pace, average/max heart rate, cadence, power, aerobic/anaerobic training
   effect, VO2 max, and the helper's intensity class (`easy`, `moderate`,
   `hard`) when present.
+- Training content and intensity: explicitly name whether the session was a
+  VO2max/速度耐力刺激课, 高强度有氧-无氧混合课, 节奏/稳态课, or 轻松/恢复跑.
+- Recent workout background: compare against recent runs, 30-day hard workouts,
+  and 30-day normal/easy workouts before judging the session.
 - Body state during the run: interpret average/max HR together with the same
   day's sleep score, HRV, resting HR, Body Battery, Training Readiness, and
   recent training load. Flag possible fatigue when HR is high for a normal pace
@@ -181,6 +186,13 @@ The running section should cover:
   similar or faster pace is a positive efficiency signal; higher HR at a
   slower or similar pace is a fatigue/heat/stress signal unless the workout is
   clearly intentional intensity.
+- Training quality: state whether it was a good training session, a useful but
+  recovery-expensive session, or a session with poor execution. Explain the
+  judgment with training effect, heart-rate response, recovery metrics, and
+  recent load.
+- Training benefit: explain what the session likely improved, such as VO2max,
+  speed endurance, aerobic capacity, threshold/tempo control, neuromuscular
+  coordination, or recovery/base mileage.
 - Load context: always report calendar-week mileage, rolling-7-day mileage,
   calendar-month mileage, and rolling-30-day mileage, plus run days and the
   count of hard/moderate/easy runs when available.
